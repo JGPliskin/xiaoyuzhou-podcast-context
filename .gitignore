@@ -1,0 +1,8 @@
+.DS_Store
+*.log
+.env
+.env.*
+*.har
+*.pcap
+downloads/
+node_modules/
