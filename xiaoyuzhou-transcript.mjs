@@ -19,6 +19,7 @@ const API_BASE_URL = 'https://api.xiaoyuzhoufm.com';
 const PODCASTER_API_BASE_URL = 'https://podcaster-api.xiaoyuzhoufm.com';
 const TOKEN_TTL_MS = 20 * 60 * 1000;
 const DEFAULT_CREDENTIALS_FILE = path.join(os.homedir(), '.opencli', 'xiaoyuzhou.json');
+const ALL_FORMATS = ['json', 'raw.json', 'txt', 'raw.txt', 'srt'];
 
 main().catch((error) => {
   console.error(`Error: ${error.message}`);
@@ -38,7 +39,16 @@ async function main() {
     return;
   }
 
-  const episodeInput = args.episode || args._[0];
+  const formats = parseFormats(args.formats);
+  const positional = args._[0];
+  const podcastInput = args.podcast || (extractPodcastId(positional) ? positional : null);
+
+  if (podcastInput) {
+    await downloadPodcastBatch(podcastInput, args, formats);
+    return;
+  }
+
+  const episodeInput = args.episode || positional;
   if (!episodeInput && !args.transcriptUrl && !args.har && !args.highlightId) {
     printHelp();
     process.exitCode = 1;
@@ -50,47 +60,21 @@ async function main() {
 
   const pageInfo = episodeInput ? await loadEpisodePage(episodeInput) : null;
   const transcriptSource = await loadTranscript(args, pageInfo);
-  const rawSegments = transcriptSource.segments;
-  const segments = normalizeSegments(rawSegments);
-
-  if (!segments.length) {
-    throw new Error('Transcript is empty or has an unsupported response shape.');
-  }
-
   const episode = pageInfo?.episode || {};
   const eid = pageInfo?.episodeId || extractEpisodeId(episodeInput) || 'unknown-episode';
-  const baseName = sanitizeFilename(`${episode.title || 'xiaoyuzhou-transcript'}_${eid}`);
 
-  const metadata = {
-    source: 'xiaoyuzhou',
+  const saved = await saveEpisodeTranscript({
+    outDir,
+    episode,
+    eid,
     episodeUrl: episodeInput ? normalizeEpisodeUrl(episodeInput) : null,
-    episodeId: eid,
-    title: episode.title || null,
-    podcastTitle: episode.podcast?.title || null,
-    podcastId: episode.pid || episode.podcast?.pid || null,
-    durationSeconds: episode.duration || null,
-    pubDate: episode.pubDate || null,
-    transcriptMediaId: episode.transcriptMediaId || episode.transcript?.mediaId || null,
-    transcriptSource: transcriptSource.info,
-    segmentCount: segments.length,
-  };
+    rawSegments: transcriptSource.segments,
+    transcriptInfo: transcriptSource.info,
+    formats,
+  });
 
-  const files = {
-    json: path.join(outDir, `${baseName}.json`),
-    rawJson: path.join(outDir, `${baseName}.raw.json`),
-    txt: path.join(outDir, `${baseName}.txt`),
-    rawTxt: path.join(outDir, `${baseName}.raw.txt`),
-    srt: path.join(outDir, `${baseName}.srt`),
-  };
-
-  await fs.writeFile(files.json, `${JSON.stringify({ metadata, segments }, null, 2)}\n`, 'utf8');
-  await fs.writeFile(files.rawJson, `${JSON.stringify(rawSegments, null, 2)}\n`, 'utf8');
-  await fs.writeFile(files.txt, renderTimestampedText(metadata, segments), 'utf8');
-  await fs.writeFile(files.rawTxt, `${segments.map((segment) => segment.text).join('\n')}\n`, 'utf8');
-  await fs.writeFile(files.srt, renderSrt(segments), 'utf8');
-
-  console.log(`Saved ${segments.length} transcript segments:`);
-  for (const file of Object.values(files)) {
+  console.log(`Saved ${saved.segmentCount} transcript segments:`);
+  for (const file of saved.files) {
     console.log(`- ${file}`);
   }
 }
@@ -103,6 +87,20 @@ function parseArgs(argv) {
       args.help = true;
     } else if (arg === '--episode' || arg === '-e') {
       args.episode = takeValue(argv, ++i, arg);
+    } else if (arg === '--podcast' || arg === '-p') {
+      args.podcast = takeValue(argv, ++i, arg);
+    } else if (arg === '--formats' || arg === '-f') {
+      args.formats = takeValue(argv, ++i, arg);
+    } else if (arg === '--delay') {
+      args.delay = Number(takeValue(argv, ++i, arg));
+    } else if (arg === '--limit') {
+      args.limit = Number(takeValue(argv, ++i, arg));
+    } else if (arg === '--force') {
+      args.force = true;
+    } else if (arg === '--access-token') {
+      args.accessToken = takeValue(argv, ++i, arg);
+    } else if (arg === '--refresh-token') {
+      args.refreshToken = takeValue(argv, ++i, arg);
     } else if (arg === '--har') {
       args.har = takeValue(argv, ++i, arg);
     } else if (arg === '--transcript-url') {
@@ -140,21 +138,30 @@ function takeValue(argv, index, flag) {
 
 function printHelp() {
   console.log(`Usage:
-  node xiaoyuzhou-transcript.mjs <episode-url> [-o downloads]
+  node xiaoyuzhou-transcript.mjs <episode-url> [-o downloads] [-f txt,raw.txt]
+  node xiaoyuzhou-transcript.mjs <podcast-url> [-o downloads] [-f raw.txt]
   node xiaoyuzhou-transcript.mjs <episode-url> --har <capture.har> [-o downloads]
   node xiaoyuzhou-transcript.mjs <episode-url> --transcript-url <cdn-url>
   node xiaoyuzhou-transcript.mjs <episode-url> --highlight-id <id> [--edition 1]
+  node xiaoyuzhou-transcript.mjs auth set-token <access-token> [refresh-token]
   node xiaoyuzhou-transcript.mjs auth send-code <phone>
   node xiaoyuzhou-transcript.mjs auth login <phone> <sms-code>
   node xiaoyuzhou-transcript.mjs auth status
 
 Notes:
   The default path downloads Xiaoyuzhou's official transcript only. It does not
-  download audio or run local ASR. Run auth login once, then pass episode URLs.
+  download audio or run local ASR. Configure credentials once via auth set-token
+  (using x-jike-access-token / x-jike-refresh-token cookies from podcaster.xiaoyuzhoufm.com)
+  or auth login, then pass episode URLs or a podcast URL for batch download.
   HAR / transcript URL / highlight id modes are fallback paths.
 
 Options:
   -e, --episode <url-or-id>       Xiaoyuzhou episode URL or episode id
+  -p, --podcast <url-or-id>       Xiaoyuzhou podcast URL or pid (batch download)
+  -f, --formats <list>            Comma-separated formats: ${ALL_FORMATS.join(',')}
+      --delay <ms>                Delay between episodes in batch mode, default: 300
+      --limit <number>            Max episodes to process in batch mode
+      --force                     Overwrite existing files in batch mode
       --credentials <path>        Credential JSON, default: ${DEFAULT_CREDENTIALS_FILE}
       --har <path>                HAR file containing transcript-highlight request
       --transcript-url <url>      Direct transcript-highlight CDN URL
@@ -173,6 +180,30 @@ async function mainAuth(argv) {
 
   if (!command || command === '--help' || command === '-h') {
     printAuthHelp();
+    return;
+  }
+
+  if (command === 'set-token') {
+    const accessToken = args.accessToken || args._[0];
+    const refreshToken = args.refreshToken || args._[1];
+    if (!accessToken && !refreshToken) {
+      throw new Error('auth set-token requires at least an access token or refresh token.');
+    }
+    const existing = await loadCredentials(credentialsFile, { allowMissing: true });
+    const credentials = normalizeCredentials({
+      access_token: accessToken ?? existing?.accessToken,
+      refresh_token: refreshToken ?? existing?.refreshToken,
+      device_id: existing?.deviceId || randomUUID().toUpperCase(),
+      uid: existing?.uid,
+      nickname: existing?.nickname,
+    });
+    await saveCredentials(credentials, credentialsFile);
+    console.log(JSON.stringify({
+      ok: true,
+      credentialsFile,
+      accessToken: credentials.accessToken ? `set (${credentials.accessToken.length} chars)` : 'missing',
+      refreshToken: credentials.refreshToken ? `set (${credentials.refreshToken.length} chars)` : 'missing',
+    }, null, 2));
     return;
   }
 
@@ -220,6 +251,7 @@ async function mainAuth(argv) {
 
 function printAuthHelp() {
   console.log(`Usage:
+  node xiaoyuzhou-transcript.mjs auth set-token <access-token> [refresh-token]
   node xiaoyuzhou-transcript.mjs auth send-code <phone> [--area-code +86]
   node xiaoyuzhou-transcript.mjs auth login <phone> <sms-code> [--area-code +86]
   node xiaoyuzhou-transcript.mjs auth status
@@ -236,6 +268,15 @@ async function sendSmsCode(phone, areaCode) {
     body: JSON.stringify({ mobilePhoneNumber: phone, areaCode }),
   });
   const text = await response.text();
+  if (response.status === 404) {
+    throw new Error(
+      'send-code failed with HTTP 404 (Xiaoyuzhou deprecated /v1/auth/send-code on podcaster-api, ' +
+      'and api.xiaoyuzhoufm.com/v1/auth/sendCode requires captchaVerifyParam). ' +
+      'Log in at https://podcaster.xiaoyuzhoufm.com in a browser, copy x-jike-access-token ' +
+      'and x-jike-refresh-token from DevTools Cookies, and run: ' +
+      'node xiaoyuzhou-transcript.mjs auth set-token <access-token> <refresh-token>'
+    );
+  }
   if (!response.ok) {
     throw new Error(`send-code failed with HTTP ${response.status}: ${text.slice(0, 200)}`);
   }
@@ -346,7 +387,7 @@ async function loadTranscript(args, pageInfo) {
   return official;
 }
 
-async function fetchOfficialTranscript(pageInfo, args) {
+async function fetchOfficialTranscript(pageInfo, args, authContext) {
   const episode = pageInfo.episode || {};
   const eid = pageInfo.episodeId || episode.eid;
   const mediaId =
@@ -358,10 +399,17 @@ async function fetchOfficialTranscript(pageInfo, args) {
     throw new Error('Episode page does not expose the eid/mediaId required by the official transcript API.');
   }
 
-  const credentialsFile = path.resolve(args.credentials || DEFAULT_CREDENTIALS_FILE);
-  let credentials = await loadCredentials(credentialsFile);
+  const credentialsFile = authContext?.credentialsFile || path.resolve(args.credentials || DEFAULT_CREDENTIALS_FILE);
+  let credentials = authContext?.credentials || await loadCredentials(credentialsFile);
   credentials = await ensureFreshCredentials(credentials, credentialsFile);
-  const transcriptUrl = await requestTranscriptUrl({ eid, mediaId }, credentials, credentialsFile);
+  const { transcriptUrl, credentials: nextCredentials } = await requestTranscriptUrl(
+    { eid, mediaId },
+    credentials,
+    credentialsFile
+  );
+  if (authContext) {
+    authContext.credentials = nextCredentials;
+  }
 
   return {
     segments: await fetchTranscriptUrl(transcriptUrl),
@@ -372,6 +420,253 @@ async function fetchOfficialTranscript(pageInfo, args) {
       mediaId,
     },
   };
+}
+
+function parseFormats(formatsArg) {
+  if (!formatsArg) {
+    return [...ALL_FORMATS];
+  }
+  const requested = formatsArg
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  if (!requested.length) {
+    throw new Error(`--formats requires at least one of: ${ALL_FORMATS.join(', ')}`);
+  }
+  const invalid = requested.filter((item) => !ALL_FORMATS.includes(item));
+  if (invalid.length) {
+    throw new Error(`Unsupported format(s): ${invalid.join(', ')}. Supported: ${ALL_FORMATS.join(', ')}`);
+  }
+  return [...new Set(requested)];
+}
+
+function buildOutputPaths(outDir, baseName, formats) {
+  const allPaths = {
+    json: path.join(outDir, `${baseName}.json`),
+    'raw.json': path.join(outDir, `${baseName}.raw.json`),
+    txt: path.join(outDir, `${baseName}.txt`),
+    'raw.txt': path.join(outDir, `${baseName}.raw.txt`),
+    srt: path.join(outDir, `${baseName}.srt`),
+  };
+  const selected = {};
+  for (const format of formats) {
+    selected[format] = allPaths[format];
+  }
+  return selected;
+}
+
+async function saveEpisodeTranscript({ outDir, episode, eid, episodeUrl, rawSegments, transcriptInfo, formats }) {
+  const segments = normalizeSegments(rawSegments, { durationSeconds: episode.duration });
+  if (!segments.length) {
+    throw new Error('Transcript is empty or has an unsupported response shape.');
+  }
+
+  const baseName = sanitizeFilename(`${episode.title || 'xiaoyuzhou-transcript'}_${eid}`);
+  const metadata = {
+    source: 'xiaoyuzhou',
+    episodeUrl,
+    episodeId: eid,
+    title: episode.title || null,
+    podcastTitle: episode.podcast?.title || null,
+    podcastId: episode.pid || episode.podcast?.pid || null,
+    durationSeconds: episode.duration || null,
+    pubDate: episode.pubDate || null,
+    transcriptMediaId: episode.transcriptMediaId || episode.transcript?.mediaId || null,
+    transcriptSource: transcriptInfo,
+    segmentCount: segments.length,
+  };
+
+  const outputs = buildOutputPaths(outDir, baseName, formats);
+  const writers = {
+    json: () => fs.writeFile(outputs.json, `${JSON.stringify({ metadata, segments }, null, 2)}\n`, 'utf8'),
+    'raw.json': () => fs.writeFile(outputs['raw.json'], `${JSON.stringify(rawSegments, null, 2)}\n`, 'utf8'),
+    txt: () => fs.writeFile(outputs.txt, renderTimestampedText(metadata, segments), 'utf8'),
+    'raw.txt': () => fs.writeFile(outputs['raw.txt'], `${segments.map((segment) => segment.text).join('\n')}\n`, 'utf8'),
+    srt: () => fs.writeFile(outputs.srt, renderSrt(segments), 'utf8'),
+  };
+
+  for (const format of formats) {
+    await writers[format]();
+  }
+
+  return {
+    segmentCount: segments.length,
+    files: Object.values(outputs),
+  };
+}
+
+async function allOutputsExist(paths) {
+  for (const filePath of paths) {
+    try {
+      await fs.access(filePath);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function downloadPodcastBatch(podcastInput, args, formats) {
+  const pid = parsePodcastIdInput(podcastInput);
+  if (!pid) {
+    throw new Error(`Invalid Xiaoyuzhou podcast URL or id: ${podcastInput}`);
+  }
+
+  const delayMs = Number.isFinite(args.delay) && args.delay >= 0 ? args.delay : 300;
+  const maxEpisodes = Number.isFinite(args.limit) && args.limit > 0 ? Math.floor(args.limit) : Infinity;
+  const outDir = path.resolve(args.outDir || 'downloads');
+  await fs.mkdir(outDir, { recursive: true });
+
+  const credentialsFile = path.resolve(args.credentials || DEFAULT_CREDENTIALS_FILE);
+  let credentials = await loadCredentials(credentialsFile);
+  credentials = await ensureFreshCredentials(credentials, credentialsFile);
+  const authContext = { credentials, credentialsFile };
+
+  const episodes = await fetchPodcastEpisodes(pid, authContext, maxEpisodes);
+  console.log(`Found ${episodes.length} episodes for podcast ${pid}.`);
+
+  let downloaded = 0;
+  let skipped = 0;
+  const unavailable = [];
+  const failed = [];
+
+  for (let i = 0; i < episodes.length; i += 1) {
+    const ep = episodes[i];
+    const eid = ep.eid;
+    const label = `[${i + 1}/${episodes.length}] ${ep.title || eid}`;
+    const baseName = sanitizeFilename(`${ep.title || 'xiaoyuzhou-transcript'}_${eid}`);
+    const outputPaths = Object.values(buildOutputPaths(outDir, baseName, formats));
+
+    if (!args.force && await allOutputsExist(outputPaths)) {
+      skipped += 1;
+      console.log(`${label} -> SKIP (already exists)`);
+      continue;
+    }
+
+    const result = await downloadEpisodeWithRetry(ep, args, authContext, outDir, formats);
+    if (result.status === 'ok') {
+      downloaded += 1;
+      console.log(`${label} -> OK (${result.segmentCount} segments)`);
+    } else if (result.status === 'unavailable') {
+      unavailable.push({ eid, title: ep.title || null, reason: result.error });
+      console.log(`${label} -> SKIP (${result.error})`);
+    } else {
+      failed.push({ eid, title: ep.title || null, error: result.error });
+      console.log(`${label} -> FAIL (${result.error})`);
+    }
+
+    if (i < episodes.length - 1 && delayMs > 0) {
+      await sleep(delayMs);
+    }
+  }
+
+  console.log('\nBatch summary:');
+  console.log(JSON.stringify({
+    podcastId: pid,
+    total: episodes.length,
+    downloaded,
+    skipped,
+    unavailableCount: unavailable.length,
+    failedCount: failed.length,
+    unavailable,
+    failed,
+  }, null, 2));
+
+  if (failed.length && downloaded === 0 && skipped === 0) {
+    process.exitCode = 1;
+  }
+}
+
+async function downloadEpisodeWithRetry(episode, args, authContext, outDir, formats) {
+  const eid = episode.eid;
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const transcriptSource = await fetchOfficialTranscript({ episodeId: eid, episode }, args, authContext);
+      const saved = await saveEpisodeTranscript({
+        outDir,
+        episode,
+        eid,
+        episodeUrl: normalizeEpisodeUrl(eid),
+        rawSegments: transcriptSource.segments,
+        transcriptInfo: transcriptSource.info,
+        formats,
+      });
+      return { status: 'ok', segmentCount: saved.segmentCount };
+    } catch (error) {
+      const message = error?.message || String(error);
+      if (
+        message.includes('no available Xiaoyuzhou official transcript') ||
+        message.includes('does not expose the eid/mediaId')
+      ) {
+        return { status: 'unavailable', error: message };
+      }
+      if (
+        attempt < maxAttempts &&
+        (message.includes('429') || message.includes('rate limit') || message.includes('fetch failed') || message.includes('ECONNRESET'))
+      ) {
+        await sleep(attempt * 3000);
+        continue;
+      }
+      return { status: 'failed', error: message };
+    }
+  }
+  return { status: 'failed', error: 'Max retry attempts reached.' };
+}
+
+async function fetchPodcastEpisodes(pid, authContext, maxEpisodes = Infinity) {
+  const episodes = [];
+  let loadMoreKey = undefined;
+
+  while (episodes.length < maxEpisodes) {
+    const body = { pid, order: 'desc', limit: 20 };
+    if (loadMoreKey) {
+      body.loadMoreKey = loadMoreKey;
+    }
+
+    let response = await fetch(`${API_BASE_URL}/v1/episode/list`, {
+      method: 'POST',
+      headers: buildAppHeaders(authContext.credentials),
+      body: JSON.stringify(body),
+    });
+
+    if (response.status === 401 && authContext.credentials.refreshToken) {
+      authContext.credentials = await refreshCredentials(authContext.credentials, authContext.credentialsFile);
+      response = await fetch(`${API_BASE_URL}/v1/episode/list`, {
+        method: 'POST',
+        headers: buildAppHeaders(authContext.credentials),
+        body: JSON.stringify(body),
+      });
+    }
+
+    const text = await response.text();
+    if (response.status === 401) {
+      throw new Error('Xiaoyuzhou credentials are invalid or expired. Run auth set-token or auth login again.');
+    }
+    if (!response.ok) {
+      throw new Error(`Failed to fetch podcast episodes (HTTP ${response.status}): ${text.slice(0, 200)}`);
+    }
+
+    const parsed = safeJson(text);
+    const items = Array.isArray(parsed?.data) ? parsed.data : [];
+    for (const item of items) {
+      episodes.push(item);
+      if (episodes.length >= maxEpisodes) {
+        break;
+      }
+    }
+
+    loadMoreKey = parsed?.loadMoreKey;
+    if (!loadMoreKey || !items.length) {
+      break;
+    }
+  }
+
+  return episodes;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function loadCredentials(filePath, options = {}) {
@@ -487,17 +782,18 @@ async function refreshCredentials(credentials, credentialsFile) {
 }
 
 async function requestTranscriptUrl({ eid, mediaId }, credentials, credentialsFile) {
-  let result = await requestTranscriptUrlOnce({ eid, mediaId }, credentials);
-  if (result.status === 401 && credentials.refreshToken) {
-    const refreshed = await refreshCredentials(credentials, credentialsFile);
-    result = await requestTranscriptUrlOnce({ eid, mediaId }, refreshed);
+  let activeCredentials = credentials;
+  let result = await requestTranscriptUrlOnce({ eid, mediaId }, activeCredentials);
+  if (result.status === 401 && activeCredentials.refreshToken) {
+    activeCredentials = await refreshCredentials(activeCredentials, credentialsFile);
+    result = await requestTranscriptUrlOnce({ eid, mediaId }, activeCredentials);
   }
 
   if (result.status === 401) {
-    throw new Error('Xiaoyuzhou credentials are invalid or expired. Run auth login again.');
+    throw new Error('Xiaoyuzhou credentials are invalid or expired. Run auth set-token or auth login again.');
   }
   if (result.status === 429) {
-    throw new Error('Xiaoyuzhou rate limited the transcript request. Retry later.');
+    throw new Error('Xiaoyuzhou rate limited the transcript request (HTTP 429). Retry later.');
   }
   if (result.status < 200 || result.status >= 300) {
     throw new Error(`Official transcript API failed with HTTP ${result.status}: ${result.text.slice(0, 200)}`);
@@ -509,7 +805,7 @@ async function requestTranscriptUrl({ eid, mediaId }, credentials, credentialsFi
   if (!transcriptUrl) {
     throw new Error('This episode has no available Xiaoyuzhou official transcript.');
   }
-  return transcriptUrl;
+  return { transcriptUrl, credentials: activeCredentials };
 }
 
 async function requestTranscriptUrlOnce({ eid, mediaId }, credentials) {
@@ -696,54 +992,85 @@ async function fetchText(url, init) {
   return text;
 }
 
-function normalizeSegments(rawSegments) {
+function resolveTimestampMs(segment, msKeys, fallbackKeys) {
+  for (const key of msKeys) {
+    if (segment[key] !== undefined && segment[key] !== null && segment[key] !== '') {
+      return timestampToMs(segment[key], { assumeMs: true });
+    }
+  }
+  for (const key of fallbackKeys) {
+    if (segment[key] !== undefined && segment[key] !== null && segment[key] !== '') {
+      return timestampToMs(segment[key]);
+    }
+  }
+  return undefined;
+}
+
+function normalizeSegments(rawSegments, options = {}) {
+  const episodeDurationMs = Number.isFinite(options.durationSeconds)
+    ? Math.round(options.durationSeconds * 1000)
+    : undefined;
+
   return rawSegments
     .map((segment, index) => {
       const text = cleanText(segment.text || joinOffsetWords(segment.offsets) || '');
-      const startMs = timestampToMs(
-        segment.startMs ??
-        segment.startAt ??
-        segment.startTime ??
-        segment.start ??
-        segment.beginTime ??
-        segment.from ??
-        segment.offset ??
-        0
-      );
-      const explicitEndMs = timestampToMs(
-        segment.endMs ??
-        segment.endAt ??
-        segment.endTime ??
-        segment.end ??
-        segment.finishTime ??
-        segment.to
+      const startMs = resolveTimestampMs(
+        segment,
+        ['startMs', 'beginTime'],
+        ['startAt', 'startTime', 'start', 'from', 'offset']
+      ) ?? 0;
+      const explicitEndMs = resolveTimestampMs(
+        segment,
+        ['endMs', 'finishTime'],
+        ['endAt', 'endTime', 'end', 'to']
       );
       const durationMs = timestampToMs(segment.duration);
-      const maxOffset = Math.max(
-        0,
-        ...((segment.offsets || [])
-          .map((offset) => Number(offset.ts))
-          .filter((value) => Number.isFinite(value)))
-      );
+      const offsets = Array.isArray(segment.offsets) ? segment.offsets : [];
+      const maxOffset = offsets.length
+        ? Math.max(
+            0,
+            ...offsets
+              .map((offset) => Number(offset.ts))
+              .filter((value) => Number.isFinite(value))
+          )
+        : 0;
+      const hasExplicitEnd = explicitEndMs !== undefined || durationMs !== undefined || offsets.length > 0;
+      const computedEndMs = explicitEndMs ??
+        (durationMs !== undefined ? startMs + durationMs : startMs + maxOffset + 600);
 
       return {
         index: index + 1,
         startMs,
-        endMs: explicitEndMs ?? (durationMs !== undefined ? startMs + durationMs : startMs + maxOffset + 600),
+        endMs: computedEndMs,
+        hasExplicitEnd,
         text,
-        offsets: segment.offsets || [],
+        offsets,
       };
     })
     .filter((segment) => segment.text)
     .sort((a, b) => a.startMs - b.startMs)
     .map((segment, index, segments) => {
       const next = segments[index + 1];
-      const minEnd = segment.startMs + 800;
-      let endMs = Math.max(segment.endMs, minEnd);
-      if (next && endMs >= next.startMs) {
+      let endMs;
+      if (segment.hasExplicitEnd) {
+        endMs = Math.max(segment.endMs, segment.startMs + 800);
+        if (next && endMs >= next.startMs) {
+          endMs = Math.max(segment.startMs + 300, next.startMs - 1);
+        }
+      } else if (next) {
         endMs = Math.max(segment.startMs + 300, next.startMs - 1);
+      } else if (episodeDurationMs && episodeDurationMs > segment.startMs) {
+        endMs = episodeDurationMs;
+      } else {
+        endMs = segment.startMs + 5000;
       }
-      return { ...segment, index: index + 1, endMs };
+      return {
+        index: index + 1,
+        startMs: segment.startMs,
+        endMs,
+        text: segment.text,
+        offsets: segment.offsets,
+      };
     });
 }
 
@@ -754,17 +1081,20 @@ function joinOffsetWords(offsets) {
   return offsets.map((offset) => offset.word || '').join('');
 }
 
-function timestampToMs(value) {
+function timestampToMs(value, options = {}) {
   if (value === undefined || value === null || value === '') {
     return undefined;
   }
   if (typeof value === 'number' && Number.isFinite(value)) {
+    if (options.assumeMs) {
+      return Math.round(value);
+    }
     return value < 10_000 ? Math.round(value * 1000) : Math.round(value);
   }
   if (typeof value === 'string') {
     const trimmed = value.trim();
     if (/^\d+(\.\d+)?$/.test(trimmed)) {
-      return timestampToMs(Number(trimmed));
+      return timestampToMs(Number(trimmed), options);
     }
     const parts = trimmed.split(':').map(Number);
     if (parts.length >= 2 && parts.every(Number.isFinite)) {
@@ -844,6 +1174,22 @@ function extractEpisodeId(input) {
     return null;
   }
   const match = String(input).match(/episode\/([a-f0-9]{24})|^([a-f0-9]{24})$/i);
+  return match?.[1] || match?.[2] || null;
+}
+
+function extractPodcastId(input) {
+  if (!input) {
+    return null;
+  }
+  const match = String(input).match(/podcast\/([a-f0-9]{24})/i);
+  return match?.[1] || null;
+}
+
+function parsePodcastIdInput(input) {
+  if (!input) {
+    return null;
+  }
+  const match = String(input).match(/podcast\/([a-f0-9]{24})|^([a-f0-9]{24})$/i);
   return match?.[1] || match?.[2] || null;
 }
 
